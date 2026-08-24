@@ -295,9 +295,9 @@ module RustNames = struct
   let into_i64 = parse_pattern "core::convert::Into<@U, i64>::into"
   let into_i128 = parse_pattern "core::convert::Into<@U, i128>::into"
   let into = parse_pattern "core::convert::Into<@U, @T>::into"
-  let is_vec env = match_pattern_with_type_id env.name_ctx config (mk_empty_maps ()) vec
-  let is_range env = match_pattern_with_type_id env.name_ctx config (mk_empty_maps ()) range
-  let is_option env = match_pattern_with_type_id env.name_ctx config (mk_empty_maps ()) option
+  let is_vec env = match_pattern_with_type_decl_id env.name_ctx config (mk_empty_maps ()) vec
+  let is_range env = match_pattern_with_type_decl_id env.name_ctx config (mk_empty_maps ()) range
+  let is_option env = match_pattern_with_type_decl_id env.name_ctx config (mk_empty_maps ()) option
 end
 
 let string_of_pattern pattern = Charon.NameMatcher.(pattern_to_string { tgt = TkPattern } pattern)
@@ -507,34 +507,22 @@ let rec vtable_typ_of_dyn_pred (env : env) (pred : C.dyn_predicate) : K.typ =
    or None if there is no metadata *)
 and metadata_typ_of_ty (env : env) (ty : Charon.Types.ty) : K.typ option =
   match ty with
-  | C.TAdt ty_decl_ref ->
-      begin match ty_decl_ref.id with
-      | C.TAdtId decl_id -> begin
-          let decl = env.get_nth_type decl_id in
-          match decl.ptr_metadata with
-          | C.NoMetadata -> None
-          | C.Length -> Some Krml.Helpers.usize
-          | C.VTable ty_ref ->
-              let ty_ref = { ty_ref with generics = ty_decl_ref.generics } in
-              Some (K.TBuf (typ_of_ty env (C.TAdt ty_ref), false))
-          | C.InheritFrom (C.TVar (C.Free var)) ->
-              let ty = List.nth ty_decl_ref.generics.types (C.TypeVarId.to_int var) in
-              metadata_typ_of_ty env ty
-          | C.InheritFrom _ ->
-              failwith
-                "Eurydice does not handle PtrMetadata inheritance, please consider using \
-                 monomorphized LLBC"
-        end
-      | C.TBuiltin C.TTuple ->
-          begin match List.rev @@ ty_decl_ref.generics.types with
-          (* Empty metadata for empty tuple *)
-          | [] -> None
-          (* For tuple, the type of metadata is the last element *)
-          | last :: _ -> metadata_typ_of_ty env last
-          end
-      | C.TBuiltin C.TBox -> None
-      | C.TBuiltin C.TStr -> Some Krml.Helpers.usize
-      end
+  | C.TAdt ty_decl_ref -> begin
+      let decl = env.get_nth_type ty_decl_ref.id in
+      match decl.ptr_metadata with
+      | C.NoMetadata -> None
+      | C.Length -> Some Krml.Helpers.usize
+      | C.VTable ty_ref ->
+          let ty_ref = { ty_ref with generics = ty_decl_ref.generics } in
+          Some (K.TBuf (typ_of_ty env (C.TAdt ty_ref), false))
+      | C.InheritFrom (C.TVar (C.Free var)) ->
+          let ty = List.nth ty_decl_ref.generics.types (C.TypeVarId.to_int var) in
+          metadata_typ_of_ty env ty
+      | C.InheritFrom _ ->
+          failwith
+            "Eurydice does not handle PtrMetadata inheritance, please consider using monomorphized \
+             LLBC"
+    end
   | C.TArray _ -> None
   | C.TSlice _ -> Some Krml.Helpers.usize
   | C.TVar _ ->
@@ -584,7 +572,7 @@ and ptr_typ_of_ty (env : env) ~const (ty : Charon.Types.ty) : K.typ =
   (* Special case to handle slice : &[T] *)
   | TSlice t -> Builtin.mk_slice ~const (typ_of_ty env t)
   (* Special case to handle &str *)
-  | TAdt { id = TBuiltin TStr; _ } -> Builtin.str_t ~const
+  | TAdt { builtin = Some TStr; _ } -> Builtin.str_t ~const
   (* Special case to handle DynTrait *)
   | TDynTrait pred ->
       Builtin.mk_dst_ref ~const Builtin.c_void_t (K.TBuf (vtable_typ_of_dyn_pred env pred, false))
@@ -601,33 +589,35 @@ and typ_of_ty (env : env) (ty : Charon.Types.ty) : K.typ =
   | TLiteral t -> typ_of_literal_ty env t
   | TNever -> failwith "Impossible: Never"
   | TDynTrait _ -> failwith "TODO: dyn Trait"
-  | TAdt { id = TBuiltin TBox; generics = { types = [ t ]; _ } } -> ptr_typ_of_ty ~const:false env t
+  | TAdt { builtin = Some TBox; generics = { types; _ }; _ } ->
+      let t =
+        match types with
+        | [ t ] -> t
+        | _ -> failwith "Box should have one type argument"
+      in
+      ptr_typ_of_ty ~const:false env t
   | TRef (_, t, rk) | TRawPtr (t, rk) ->
       let const = const_of_ref_kind rk in
       ptr_typ_of_ty env ~const t
-  | TAdt { id; generics = { types = [ t ]; _ } as generics } when RustNames.is_vec env id generics
-    -> Builtin.mk_vec (typ_of_ty env t)
-  | TAdt { id = TAdtId id; generics = { types = args; const_generics = generic_args; _ } } ->
-      let ts = List.map (typ_of_ty env) args in
-      let cgs = List.map (cg_of_const_generic env) generic_args in
-      let lid = lid_of_type_decl_id env id in
-      K.fold_tapp (lid, ts, cgs)
-  | TAdt { id = TBuiltin TTuple; generics = { types = args; const_generics; _ } } ->
+  | TAdt { id; generics = { types = [ t ]; _ } as generics; builtin }
+    when RustNames.is_vec env id builtin generics -> Builtin.mk_vec (typ_of_ty env t)
+  | TAdt { generics = { types = args; const_generics; _ }; builtin = Some TTuple; _ } ->
       assert (const_generics = []);
       begin match args with
       | [] -> TUnit
       | [ t ] -> typ_of_ty env t (* charon issue #205 *)
       | _ -> TTuple (List.map (typ_of_ty env) args)
       end
+  | TAdt { id; generics = { types = args; const_generics = generic_args; _ }; builtin = None } ->
+      let ts = List.map (typ_of_ty env) args in
+      let cgs = List.map (cg_of_const_generic env) generic_args in
+      let lid = lid_of_type_decl_id env id in
+      K.fold_tapp (lid, ts, cgs)
   | TArray (t, cg) -> typ_of_struct_arr env t cg
   | TSlice t ->
       (* Appears in instantiations of patterns and generics, so we translate it to a placeholder. *)
       TApp (Builtin.derefed_slice, [ typ_of_ty env t ])
-  | TAdt { id = TBuiltin TStr; generics = { types = []; _ } } -> Builtin.deref_str_t
-  | TAdt { id = TBuiltin f; generics = { types = args; const_generics; _ } } ->
-      List.iter (fun x -> print_endline (C.show_constant_expr x)) const_generics;
-      fail "TODO: Adt/Builtin %s (%d) %d " (C.show_builtin_ty f) (List.length args)
-        (List.length const_generics)
+  | TAdt { builtin = Some TStr; _ } -> Builtin.deref_str_t
   | TTraitType _ -> failwith ("TODO: TraitTypes " ^ Charon.Print.ty_to_string env.format_env ty)
   | TFnPtr fn_sig ->
       let { C.inputs = ts; output = t; _ } = fn_sig.binder_value in
@@ -917,7 +907,8 @@ let rec expression_of_place (env : env) (p : C.place) : K.expr =
       | C.Deref, _, TRef (_, TSlice _, _) | C.Deref, _, TRawPtr (TSlice _, _) -> assert false
       | ( C.Deref,
           _,
-          (TRawPtr _ | TRef _ | TAdt { id = TBuiltin TBox; generics = { types = [ _ ]; _ } }) ) ->
+          (TRawPtr _ | TRef _ | TAdt { builtin = Some TBox; generics = { types = [ _ ]; _ }; _ }) )
+        ->
           (* All types represented as a pointer at run-time, compiled to a C pointer *)
           begin match !*sub_e.K.typ with
           | TBuf (t_pointee, _) ->
@@ -934,7 +925,7 @@ let rec expression_of_place (env : env) (p : C.place) : K.expr =
           end
       | ( Field (None, field_id),
           { kind = PlaceProjection (sub_place, C.Deref); _ },
-          C.TAdt { id = TAdtId typ_id; _ } ) ->
+          C.TAdt { id = typ_id; builtin = None; _ } ) ->
           let field_name = lookup_field env typ_id field_id in
           let sub_e = expression_of_place env sub_place in
           let place_typ = typ_of_ty env p.ty in
@@ -956,7 +947,7 @@ let rec expression_of_place (env : env) (p : C.place) : K.expr =
                        mk_deref ~const (Krml.Helpers.assert_tbuf_or_tarray sub_e.K.typ) sub_e.K.node),
                      field_name ))
           end
-      | Field (variant_id, field_id), _, C.TAdt { id = TAdtId typ_id; _ } -> begin
+      | Field (variant_id, field_id), _, C.TAdt { id = typ_id; builtin = None; _ } -> begin
           let place_typ = typ_of_ty env p.ty in
           match variant_id with
           | None ->
@@ -987,7 +978,8 @@ let rec expression_of_place (env : env) (p : C.place) : K.expr =
         end
       | ( Field (None, i),
           _,
-          C.TAdt { id = TBuiltin TTuple; generics = { types = tys; const_generics = cgs; _ } } ) ->
+          C.TAdt { generics = { types = tys; const_generics = cgs; _ }; builtin = Some TTuple; _ } )
+        ->
           let place_typ = typ_of_ty env p.ty in
           assert (cgs = []);
           (* match e with (_, ..., _, x, _, ..., _) -> x *)
@@ -1813,12 +1805,12 @@ let expression_of_operand (env : env) (op : C.operand) : K.expr =
 
 let is_str env var_id =
   match lookup_with_original_type env var_id with
-  | _, _, TRef (_, TAdt { id = TBuiltin TStr; generics = { types = []; _ } }, _) -> true
+  | _, _, TRef (_, TAdt { builtin = Some TStr; generics = { types = []; _ }; _ }, _) -> true
   | _ -> false
 
 let is_box_place (p : C.place) =
   match p.ty with
-  | C.TAdt { id = TBuiltin TBox; _ } -> true
+  | C.TAdt { builtin = Some TBox; _ } -> true
   | _ -> false
 
 (* returns either a regular naked C pointer, or a fat pointer in the case of DSTs (i.e. with non-empty metadata) *)
@@ -2044,7 +2036,7 @@ let expression_of_rvalue (env : env) (p : C.rvalue) expected_ty : K.expr =
       K.(
         with_type expected_t
           (EApp (Builtin.(expr_of_builtin_t discriminant) [ e.typ; expected_t ], [ e ])))
-  | Aggregate (AggregatedAdt ({ id = TBuiltin TTuple; _ }, _, None), ops) ->
+  | Aggregate (AggregatedAdt ({ builtin = Some TTuple; _ }, _, None), ops) ->
       begin match ops with
       | [] -> K.with_type TUnit K.EUnit
       | [ op ] -> expression_of_operand env op
@@ -2055,7 +2047,7 @@ let expression_of_rvalue (env : env) (p : C.rvalue) expected_ty : K.expr =
       end
   | Aggregate
       ( AggregatedAdt
-          ( { id = TAdtId typ_id; generics = { types = typ_args; const_generics; _ } },
+          ( { id = typ_id; generics = { types = typ_args; const_generics; _ }; builtin = None },
             variant_id,
             None ),
         args ) ->
@@ -2089,8 +2081,6 @@ let expression_of_rvalue (env : env) (p : C.rvalue) expected_ty : K.expr =
                   (fun i (f, a) -> Some (struct_field_name i f), a)
                   (List.combine fields args)))
       end
-  | Aggregate (AggregatedAdt ({ id = TBuiltin _; _ }, _, _), _) ->
-      failwith "unsupported: AggregatedAdt / TAssume"
   | Aggregate (AggregatedArray (t, cg), ops) ->
       let ty = typ_of_ty env t in
       let typ_arr = typ_of_struct_arr env t cg in
@@ -2355,8 +2345,8 @@ and expression_of_statement_kind (env : env) (ret_var : C.local_id) (s : C.state
             (* Will decay. See comment above maybe_addrof *)
             rhs
         | ( FunId (FBuiltin (Index { is_array = false; mutability = _; is_range = false })),
-            [ TAdt { id; generics } ] )
-          when RustNames.is_vec env id generics ->
+            [ TAdt { id; generics; builtin } ] )
+          when RustNames.is_vec env id builtin generics ->
             (* Will decay. See comment above maybe_addrof *)
             rhs
         | FunId (FBuiltin (Index { is_array = false; mutability = _; is_range = false })), _ ->
@@ -2407,7 +2397,7 @@ and expression_of_statement_kind (env : env) (ret_var : C.local_id) (s : C.state
       let scrutinee = expression_of_place env p in
       let typ_id, typ_lid, variant_name_of_variant_id =
         match p.ty with
-        | TAdt { id = TAdtId typ_id; _ } ->
+        | TAdt { id = typ_id; _ } ->
             let ty = env.get_nth_type typ_id in
             let variants =
               match ty.kind with
@@ -2511,6 +2501,10 @@ let is_global_initializer : C.fun_source -> bool = function
 
 let decl_of_id (env : env) (id : C.item_id) : K.decl option =
   match id with
+  | IdType id
+    when match (env.get_nth_type id).src with
+         | BuiltinType _ -> true
+         | _ -> false -> None
   | IdType id -> begin
       let decl = env.get_nth_type id in
       let { C.item_meta; def_id; kind; generics = { types = type_params; const_generics; _ }; _ } =
