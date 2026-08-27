@@ -2149,21 +2149,47 @@ let expression_of_fn_op_dynamic (env : env) ({ func; args; dest } : C.call) =
   let rhs = K.with_type ret_t @@ K.EApp (fHd, args) in
   Krml.Helpers.with_unit @@ K.EAssign (lhs, rhs)
 
-(** Handles only the `SwitchInt` for 128-bit integers. Turn the switch expression into if-then-else
+let switch_branch branches branch_id = C.BranchId.nth branches branch_id
+
+let switch_branches (data : C.switch_data) blocks =
+  List.combine (C.switch_group_by_branch data) blocks
+
+let scalar_of_switch_case (case : C.constant_expr) =
+  match case.kind with
+  | CLiteral (VScalar sv) -> sv
+  | _ -> failwith "Expected an integer switch case"
+
+let constant_of_switch_case (case : C.constant_expr) =
+  match case.kind with
+  | CLiteral (VScalar sv) -> constant_of_scalar_value sv
+  | CLiteral (VChar c) -> UInt32, string_of_int (Uchar.to_int c)
+  | _ -> failwith "Expected an integer or character switch case"
+
+let variant_of_switch_case (case : C.constant_expr) =
+  match case.kind with
+  | CDiscriminant (_, variant_id) -> variant_id
+  | _ -> failwith "Expected an enum variant switch case"
+
+(** Handles only switches for 128-bit integers. Turn the switch expression into if-then-else
     expressions. This is to work around the Krml integer type limitations. *)
-let rec expression_of_switch_128bits env ret_var scrutinee branches default : K.expr =
+let rec expression_of_switch_128bits env ret_var scrutinee branches fallback : K.expr =
   let scrutinee = expression_of_operand env scrutinee in
-  let else_branch = expression_of_block env ret_var default in
-  let folder (svs, stmt) else_branch =
-    (* [i1, i2, ..., in] ==> scrutinee == i1 || scrutinee == i2 || ... || scrutinee == in *)
+  let else_branch =
+    match fallback with
+    | Some block -> expression_of_block env ret_var block
+    | None -> failwith "A 128-bit integer switch must have a fallback branch"
+  in
+  let folder (cases, block) else_branch =
     let guard =
-      let make_eq sv = mk_op_app Eq scrutinee [ expression_of_scalar_value sv ] in
-      List.map make_eq svs |> function
+      let make_eq case =
+        mk_op_app Eq scrutinee [ expression_of_scalar_value (scalar_of_switch_case case) ]
+      in
+      List.map make_eq cases |> function
       | [] -> Krml.Helpers.etrue
-      | x :: lst -> List.fold_left Krml.Helpers.mk_or x lst
+      | guard :: guards -> List.fold_left Krml.Helpers.mk_or guard guards
     in
     (* the "then" body of the if-then-else expression *)
-    let body = expression_of_block env ret_var stmt in
+    let body = expression_of_block env ret_var block in
     (* combines the types: compare each branch and then generate the correct type *)
     let typ = lesser body.K.typ else_branch.K.typ in
     K.(with_type typ (EIfThenElse (guard, body, else_branch)))
@@ -2366,34 +2392,48 @@ and expression_of_statement_kind (env : env) (ret_var : C.local_id) (s : C.state
       assert (n = 0);
       K.(with_type TAny EContinue)
   | Nop -> Krml.Helpers.eunit
-  | Switch (If (op, s1, s2)) ->
-      let e1 = expression_of_block env ret_var s1 in
-      let e2 = expression_of_block env ret_var s2 in
-      let t = lesser e1.typ e2.typ in
-      K.(with_type t (EIfThenElse (expression_of_operand env op, e1, e2)))
-  | Switch (SwitchInt (scrutinee, int_ty, branches, default)) ->
-      let branches =
-        List.map
-          (fun (litl, block) -> List.map Charon.ValuesUtils.literal_as_scalar litl, block)
-          branches
-      in
-      if int_ty = TInt I128 || int_ty = TUInt U128 then
-        expression_of_switch_128bits env ret_var scrutinee branches default
-      else
-        let scrutinee = expression_of_operand env scrutinee in
-        let branches =
-          List.concat_map
-            (fun (svs, stmt) ->
-              List.map
-                (fun sv ->
-                  K.SConstant (constant_of_scalar_value sv), expression_of_block env ret_var stmt)
-                svs)
-            branches
-          @ [ K.SWild, expression_of_block env ret_var default ]
-        in
-        let t = Krml.KList.reduce lesser (List.map (fun (_, e) -> e.K.typ) branches) in
-        K.(with_type t (ESwitch (scrutinee, branches)))
-  | Switch (Match (p, branches, default)) ->
+  | Switch (({ scrutinee = SwitchValue op; _ } as data), blocks) ->
+      begin match C.switch_as_if data with
+      | Some (then_branch, else_branch) ->
+          let e1 = expression_of_block env ret_var (switch_branch blocks then_branch) in
+          let e2 = expression_of_block env ret_var (switch_branch blocks else_branch) in
+          let t = lesser e1.typ e2.typ in
+          K.(with_type t (EIfThenElse (expression_of_operand env op, e1, e2)))
+      | None ->
+          let is_128bits =
+            match op with
+            | Copy { ty = TLiteral (TInt I128 | TUInt U128); _ }
+            | Move { ty = TLiteral (TInt I128 | TUInt U128); _ }
+            | Constant { ty = TLiteral (TInt I128 | TUInt U128); _ } -> true
+            | _ -> false
+          in
+          let grouped_branches =
+            switch_branches data blocks |> List.filter (fun (cases, _) -> cases <> [])
+          in
+          let fallback = Option.map (switch_branch blocks) data.fallback in
+          if is_128bits then
+            expression_of_switch_128bits env ret_var op grouped_branches fallback
+          else
+            let scrutinee = expression_of_operand env op in
+            let cases =
+              List.concat_map
+                (fun (cases, block) ->
+                  List.map
+                    (fun case ->
+                      ( K.SConstant (constant_of_switch_case case),
+                        expression_of_block env ret_var block ))
+                    cases)
+                grouped_branches
+            in
+            let cases =
+              match fallback with
+              | Some block -> cases @ [ K.SWild, expression_of_block env ret_var block ]
+              | None -> cases
+            in
+            let t = Krml.KList.reduce lesser (List.map (fun (_, e) -> e.K.typ) cases) in
+            K.(with_type t (ESwitch (scrutinee, cases)))
+      end
+  | Switch (({ scrutinee = SwitchDiscriminant p; fallback; _ } as data), blocks) ->
       let scrutinee = expression_of_place env p in
       let typ_id, typ_lid, variant_name_of_variant_id =
         match p.ty with
@@ -2414,10 +2454,12 @@ and expression_of_statement_kind (env : env) (ret_var : C.local_id) (s : C.state
 
       let branches =
         List.concat_map
-          (fun (variant_ids, branch) ->
+          (fun (cases, block) ->
             List.map
-              (fun variant_id ->
-                let variant_name, n_fields = variant_name_of_variant_id variant_id in
+              (fun case ->
+                let variant_name, n_fields =
+                  variant_of_switch_case case |> variant_name_of_variant_id
+                in
                 let dummies = List.init n_fields (fun _ -> K.(with_type TAny PWild)) in
                 let pat =
                   if is_enum env typ_id then
@@ -2426,16 +2468,20 @@ and expression_of_statement_kind (env : env) (ret_var : C.local_id) (s : C.state
                     K.PCons (variant_name, dummies)
                 in
                 let pat = K.with_type scrutinee.typ pat in
-                [], pat, expression_of_block env ret_var branch)
-              variant_ids)
-          branches
+                [], pat, expression_of_block env ret_var block)
+              cases)
+          (switch_branches data blocks)
       in
       let branches =
         branches
         @
-        match default with
-        | Some default ->
-            [ [], K.with_type scrutinee.typ K.PWild, expression_of_block env ret_var default ]
+        match fallback with
+        | Some branch_id ->
+            [
+              ( [],
+                K.with_type scrutinee.typ K.PWild,
+                expression_of_block env ret_var (switch_branch blocks branch_id) );
+            ]
         | None -> []
       in
       let t = Krml.KList.reduce lesser (List.map (fun (_, _, e) -> e.K.typ) branches) in
