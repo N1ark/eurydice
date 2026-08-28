@@ -85,9 +85,7 @@ Eurydice_arr_2d closure_f(void)
 
 void closure_main(void)
 {
-  /* original Rust expression is not an lvalue in C */
-  Eurydice_arr_2d lvalue = closure_f();
-  size_t actual = lvalue.data->data[0U];
+  size_t actual = closure_f().data->data[0U];
   size_t expected = (size_t)0U;
   const_size_t__x2 uu____0 = { .fst = &actual, .snd = &expected };
   EURYDICE_ASSERT(uu____0.fst[0U] == uu____0.snd[0U], "panic!");
