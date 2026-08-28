@@ -310,7 +310,7 @@ bool array_const_eq_af(Eurydice_arr_a0 x, Eurydice_arr_a0 y)
 uint8_t array_fun(Eurydice_dst_ref_shared_60 x)
 {
   return
-    array_to_subslice_shared_d4(&x.ptr[0U],
+    array_to_subslice_shared_d4(x.ptr,
       (KRML_CLITERAL(core_ops_range_Range_87){ .start = (size_t)0U, .end = (size_t)1U })).ptr[0U];
 }
 

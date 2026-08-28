@@ -239,9 +239,6 @@ module RustNames = struct
     in
     [
     (* slices *)
-    parse_pattern "SliceIndexShared<'_, @T>", Builtin.(slice_index_mut || slice_index_shared);
-    parse_pattern "SliceIndexMut<'_, @T>", Builtin.slice_index_mut;
-
     parse_pattern "core::slice::index::{core::ops::index::Index<[@T], @I, @Clause2_Output>}::index<'_, @, core::ops::range::Range<usize>, [@]>", builtin_of_function Builtin.(slice_subslice_func_mut || slice_subslice_func_shared);
     parse_pattern "core::slice::index::{core::ops::index::IndexMut<[@T], @I, @Clause2_Output>}::index_mut<'_, @, core::ops::range::Range<usize>, [@]>", builtin_of_function Builtin.slice_subslice_func_mut;
     parse_pattern "core::slice::index::{core::ops::index::Index<[@T], @I, @Clause2_Output>}::index<'_, @, core::ops::range::RangeTo<usize>, [@]>", builtin_of_function Builtin.(slice_subslice_to_func_mut || slice_subslice_to_func_shared);
@@ -258,8 +255,6 @@ module RustNames = struct
     parse_pattern "core::array::{core::ops::index::IndexMut<[@T; @N], @I, @Clause2_Clause0_Output>}::index_mut<'_, @, core::ops::range::RangeFrom<usize>, [@], @>", builtin_of_function Builtin.array_to_subslice_from_func_mut;
 
     (* slices <-> arrays *)
-    parse_pattern "ArrayToSliceShared<'_, @T, @N>", builtin_of_function Builtin.(array_to_slice_func_mut || array_to_slice_func_shared);
-    parse_pattern "ArrayToSliceMut<'_, @T, @N>", builtin_of_function Builtin.array_to_slice_func_mut;
     parse_pattern "core::convert::{core::convert::TryInto<@T, @U, @Clause2_Error>}::try_into<&'_ [@T], [@T; @], core::array::TryFromSliceError>", Builtin.slice_to_array;
     parse_pattern "core::convert::{core::convert::TryInto<@T, @U, @Clause2_Error>}::try_into<&'_ mut [@T], [@T; @], core::array::TryFromSliceError>", Builtin.slice_to_array;
     parse_pattern "core::convert::{core::convert::TryInto<@T, @U, @Clause2_Error>}::try_into<&'_ [@T], &'_ [@T; @], core::array::TryFromSliceError>", Builtin.slice_to_ref_array;
@@ -902,6 +897,24 @@ let rec expression_of_place (env : env) (p : C.place) : K.expr =
       (* L.log "AstOfLlbc" "e=%a\nty=%s\npe=%s\n" pexpr sub_e (C.show_ty sub_place.ty) *)
       (*   (C.show_projection_elem pe); *)
       match pe, sub_place, sub_place.ty with
+      | ProjIndex (offset, from_end), _, _ ->
+          let buffer, elem_t, len = buffer_of_place env sub_place in
+          let offset = expression_of_projection_operand env offset in
+          let offset =
+            if from_end then
+              let typ = Krml.Helpers.fold_arrow [ len.typ; offset.typ ] len.typ in
+              let sub = K.with_type typ (K.EOp (Sub, len.typ)) in
+              K.with_type len.typ (K.EApp (sub, [ len; offset ]))
+            else
+              offset
+          in
+          K.with_type elem_t (K.EBufRead (buffer, offset))
+      | Subslice (from, _, _), _, _ ->
+          (* The enclosing borrow carries the subslice length as pointer metadata. The place itself
+             only needs to identify its first element. *)
+          let buffer, elem_t, _ = buffer_of_place env sub_place in
+          let from = expression_of_projection_operand env from in
+          K.with_type elem_t (K.EBufRead (buffer, from))
       (* slices simply cannot be dereferenced into places which have unknown size.
          They are supposed to be reborrowed again directly after the deref which is handled in expression_of_rvalue *)
       | C.Deref, _, TRef (_, TSlice _, _) | C.Deref, _, TRawPtr (TSlice _, _) -> assert false
@@ -1014,6 +1027,57 @@ let rec expression_of_place (env : env) (p : C.place) : K.expr =
       (* | PlaceProjection () *)
       | _ -> fail "unexpected / ill-typed projection"
     end
+
+and buffer_of_place (env : env) (p : C.place) : K.expr * K.typ * K.expr =
+  match p.ty, p.kind with
+  | TArray (t, cg), _ ->
+      let elem_t = typ_of_ty env t in
+      let array = expression_of_place env p in
+      let buffer_t = maybe_cg_array env t cg in
+      let buffer = K.with_type buffer_t (K.EField (array, "data")) in
+      buffer, elem_t, expression_of_const_generic env cg
+  | TSlice t, _ ->
+      let elem_t = typ_of_ty env t in
+      let slice =
+        match dst_reference_of_place env p with
+        | Some slice -> slice
+        | None -> fail "expected a slice place, got `%s`" (C.show_place p)
+      in
+      let const =
+        match slice.typ with
+        | TApp (lid, _) when lid = Builtin.dst_ref_shared -> true
+        | TApp (lid, _) when lid = Builtin.dst_ref_mut -> false
+        | _ -> fail "expected a slice reference, got %a" ptyp slice.typ
+      in
+      let buffer =
+        match p.kind with
+        | PlaceProjection (_, Deref) -> K.EField (slice, "ptr")
+        | _ ->
+            let place = expression_of_place env p in
+            K.ECast (place, K.TBuf (elem_t, const))
+      in
+      let buffer = K.with_type (K.TBuf (elem_t, const)) buffer in
+      let len = K.with_type Krml.Helpers.usize (K.EField (slice, "meta")) in
+      buffer, elem_t, len
+  | _ -> fail "expected an array or slice place, got `%s`" (C.show_place p)
+
+and dst_reference_of_place (env : env) (p : C.place) : K.expr option =
+  match p.kind with
+  | PlaceProjection (reference, Deref) ->
+      let reference = expression_of_place env reference in
+      begin match reference.typ with
+      | TApp (lid, _) when is_dst_ref lid -> Some reference
+      | _ -> None
+      end
+  | PlaceProjection (parent, Field _) -> dst_reference_of_place env parent
+  | _ -> None
+
+and expression_of_projection_operand (env : env) (operand : C.operand) : K.expr =
+  match operand with
+  | Copy p | Move p -> expression_of_place env p
+  | Constant { kind = CLiteral l; _ } -> expression_of_literal env l
+  | Constant { kind = CVar var; _ } -> expression_of_cg_var_id env (C.expect_free_var var)
+  | _ -> fail "unsupported projection operand: `%s`" (C.show_operand operand)
 
 let expression_of_place (env : env) (p : C.place) : K.expr =
   L.log "AstOfLlbc" "expression of place: %s" (C.show_place p);
@@ -2030,6 +2094,23 @@ let expression_of_rvalue (env : env) (p : C.rvalue) expected_ty : K.expr =
   | UnaryOp (op, o1) -> mk_op_app (op_of_unop op) (expression_of_operand env o1) []
   | BinaryOp (op, o1, o2) ->
       mk_op_app (op_of_binop op) (expression_of_operand env o1) [ expression_of_operand env o2 ]
+  | Repeat (operand, ty, len) ->
+      let operand = expression_of_operand env operand in
+      let elem_t = typ_of_ty env ty in
+      let array_t = maybe_cg_array env ty len in
+      let len = expression_of_const_generic env len in
+      let repeat =
+        K.with_type
+          (Krml.Helpers.fold_arrow Builtin.array_repeat.cg_args Builtin.array_repeat.typ)
+          (K.EQualified Builtin.array_repeat.name)
+      in
+      let offset = List.length env.binders - List.length env.cg_binders in
+      let repeat_t =
+        Krml.DeBruijn.(subst_t elem_t 0 (subst_ct offset len 0 Builtin.array_repeat.typ))
+      in
+      let repeat = K.with_type repeat_t (K.ETApp (repeat, [ len ], [], [ elem_t ])) in
+      let array = K.with_type array_t (K.EApp (repeat, [ operand ])) in
+      K.with_type (typ_of_ty env expected_ty) (mk_expr_arr_struct array)
   | Discriminant sub_p ->
       let e = expression_of_place env sub_p in
       let expected_t = typ_of_ty env expected_ty in
@@ -2080,6 +2161,18 @@ let expression_of_rvalue (env : env) (p : C.rvalue) expected_ty : K.expr =
                (List.mapi
                   (fun i (f, a) -> Some (struct_field_name i f), a)
                   (List.combine fields args)))
+      end
+  | Aggregate (AggregatedRawPtr (ty, rk), [ data; metadata ]) ->
+      let const = const_of_ref_kind rk in
+      let typ = typ_of_ty env (TRawPtr (ty, rk)) in
+      let data = expression_of_operand env data in
+      let metadata = expression_of_operand env metadata in
+      begin match destruct_dst_ref_typ typ with
+      | Some (base, _) ->
+          let ptr_typ = K.TBuf (base, const) in
+          let ptr = K.with_type ptr_typ (K.ECast (data, ptr_typ)) in
+          K.with_type typ (K.EFlat [ Some "ptr", ptr; Some "meta", metadata ])
+      | None -> K.with_type typ (K.ECast (data, typ))
       end
   | Aggregate (AggregatedArray (t, cg), ops) ->
       let ty = typ_of_ty env t in
@@ -2227,78 +2320,6 @@ and expression_of_statement_kind (env : env) (ret_var : C.local_id) (s : C.state
       | _ -> Krml.Helpers.eunit
       end
   | Assert (a, _on_failure, _) -> expression_of_assertion env a
-  | Call
-      ( {
-          func =
-            FnOpRegular
-              {
-                kind = FunId (FBuiltin ArrayRepeat);
-                generics = { types = [ ty ]; const_generics = [ c ]; _ };
-                _;
-              };
-          args = [ e ];
-          dest;
-          _;
-        },
-        _ ) ->
-      (* Special treatment *)
-      let e = expression_of_operand env e in
-      let t = typ_of_ty env ty in
-      let t_array = maybe_cg_array env ty c in
-      let len = expression_of_const_generic env c in
-      let dest = expression_of_place env dest in
-      let repeat =
-        K.(
-          with_type
-            (Krml.Helpers.fold_arrow Builtin.array_repeat.cg_args Builtin.array_repeat.typ)
-            (EQualified Builtin.array_repeat.name))
-      in
-      let diff = List.length env.binders - List.length env.cg_binders in
-      let repeat =
-        K.(
-          with_type
-            Krml.DeBruijn.(subst_t t 0 (subst_ct diff len 0 Builtin.array_repeat.typ))
-            (ETApp (repeat, [ len ], [], [ t ])))
-      in
-      Krml.Helpers.with_unit
-        K.(
-          EAssign
-            ( dest,
-              with_type dest.typ (mk_expr_arr_struct (with_type t_array (EApp (repeat, [ e ])))) ))
-  | Call
-      ( {
-          func =
-            FnOpRegular
-              {
-                kind =
-                  FunId (FBuiltin (Index { is_array = true; mutability = _; is_range = false }));
-                generics = { types = [ ty ]; const_generics = [ cg ]; _ };
-                _;
-              };
-          args = [ e1; e2 ];
-          dest;
-          _;
-        },
-        _ ) ->
-      (* Special treatment for e1[e2] of array which are translated into struct.
-         e1[e2] is translated as fn ArrayIndexShared<T,N>(&[T;N], usize) -> &T
-
-         Since [T;N] is translated into arr$T$N, we need to first dereference
-         the e1 to get the struct, and then take its field "data" to get the
-         array
-
-         We construct dest := &( *e1).data[e2]
-         *)
-      let e1 = expression_of_operand env e1 in
-      let e2 = expression_of_operand env e2 in
-      let t = typ_of_ty env ty in
-      let t_array = maybe_cg_array env ty cg in
-      (* let const = const_of_tbuf e1.K.typ in *)
-      let e1 = Krml.Helpers.(mk_deref ~const:true (Krml.Helpers.assert_tbuf e1.K.typ) e1.K.node) in
-      let e1 = K.with_type t_array (K.EField (e1, "data")) in
-      let dest = expression_of_place env dest in
-      Krml.Helpers.with_unit
-        K.(EAssign (dest, addrof ~const:false (with_type t (EBufRead (e1, e2)))))
   | Call ({ func = FnOpRegular fn_ptr; args; dest; _ }, _)
     when Charon.NameMatcher.match_fn_ptr env.name_ctx RustNames.config RustNames.from_u16 fn_ptr
          || Charon.NameMatcher.match_fn_ptr env.name_ctx RustNames.config RustNames.from_u32 fn_ptr
@@ -2356,28 +2377,6 @@ and expression_of_statement_kind (env : env) (ret_var : C.local_id) (s : C.state
           hd
         else
           K.with_type output_t (K.EApp (hd, args))
-      in
-      (* This does something similar to maybe_addrof *)
-      let rhs =
-        (* TODO: determine whether extra_types is necessary *)
-        let extra_types =
-          match fn_ptr.kind with
-          | TraitMethod ({ kind = TraitImpl { id = _; generics }; _ }, _) -> generics.types
-          | _ -> []
-        in
-        match fn_ptr.kind, fn_ptr.generics.types @ extra_types with
-        | ( FunId (FBuiltin (Index { is_array = false; mutability = _; is_range = false })),
-            [ TSlice _ ] ) ->
-            (* Will decay. See comment above maybe_addrof *)
-            rhs
-        | ( FunId (FBuiltin (Index { is_array = false; mutability = _; is_range = false })),
-            [ TAdt { id; generics; builtin } ] )
-          when RustNames.is_vec env id builtin generics ->
-            (* Will decay. See comment above maybe_addrof *)
-            rhs
-        | FunId (FBuiltin (Index { is_array = false; mutability = _; is_range = false })), _ ->
-            K.(with_type (TBuf (rhs.typ, false)) (EAddrOf rhs))
-        | _ -> rhs
       in
       Krml.Helpers.with_unit K.(EAssign (dest, rhs))
   | Call (({ func = FnOpDynamic _; _ } as call), _) -> expression_of_fn_op_dynamic env call
