@@ -2929,7 +2929,7 @@ let file_of_crate (crate : Charon.LlbcAst.crate) : Krml.Ast.file =
     Printf.eprintf "ERROR: Eurydice expects Charon to be invoked with `--preset=eurydice`\n";
     exit 255
   end;
-  let declarations = flatten_declarations declarations in
+  let declarations = flatten_declarations (Option.get declarations) in
   seen := 0;
   total := List.length declarations;
   let format_env = Charon.Print.crate_to_fmt_env crate in
